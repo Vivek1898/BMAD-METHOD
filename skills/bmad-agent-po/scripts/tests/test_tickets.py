@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -2047,6 +2048,47 @@ class ActiveInitiativeTests(TreeCase):
         self.configure("initiative-gone")
         self.configure("initiative-checkout", layer="config.user.toml")
         self.assertEqual(self.ok(run("next", cwd=self.root))["folder"], "initiative-checkout")
+
+
+def load_tickets():
+    spec = importlib.util.spec_from_file_location("tickets_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FrontmatterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.t = load_tickets()
+
+    def parse(self, block):
+        return self.t.parse_frontmatter(f"---\n{block}\n---\n", "x.md")
+
+    def test_values_read_as_yaml_reads_them(self):
+        for block, expected in (
+            ("status: done # merged in #42", {"status": "done"}),
+            ("status: 'built' # draft | built | done", {"status": "built"}),
+            ("after:   # no prerequisites", {"after": ""}),
+            ('title: "Fix #42"', {"title": "Fix #42"}),
+            ("link: https://example.com/#anchor", {"link": "https://example.com/#anchor"}),
+            ('after: ["a, b", c] # gates', {"after": ["a, b", "c"]}),
+            ("id: 6\nhitl: true", {"id": 6, "hitl": True}),
+            ("blocked_at: 2026-11-02", {"blocked_at": "2026-11-02"}),
+        ):
+            with self.subTest(block=block):
+                self.assertEqual(self.parse(block), expected)
+
+    def test_invalid_yaml_names_the_file(self):
+        with self.assertRaisesRegex(
+            self.t.TicketError, r"^x\.md: frontmatter is not valid YAML at line 2: mapping values"
+        ):
+            self.parse("title: Fix: login")
+
+    def test_a_quoted_value_reads_back_exactly(self):
+        for value in ("a   # b", "line\x85break\u2028and\u2029more", "del\x7f c1\x9f", 'it\'s "x" \\ y'):
+            with self.subTest(value=value):
+                self.assertEqual(self.parse(f"reason: {self.t.quoted(value)}"), {"reason": value})
 
 
 if __name__ == "__main__":

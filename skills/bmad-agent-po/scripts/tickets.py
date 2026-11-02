@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["pyyaml>=6.0.2,<7"]
 # ///
 """tickets — read a ticket tree and answer what is next.
 
@@ -48,6 +49,8 @@ import unicodedata
 from datetime import date
 from pathlib import Path
 
+import yaml
+
 sys.dont_write_bytecode = True
 
 STATUSES = ("draft", "ready-for-dev", "in-progress", "in-review", "built", "done", "blocked", "dropped")
@@ -73,7 +76,6 @@ EPIC_RE = re.compile(r"^epic-[^/]+$")
 BREAKDOWN = "tickets.toml"
 TICKETS = "tickets"
 TABLES = ("initiative", "epic", "entry")
-QUOTED_COMMENT_RE = re.compile(r"""^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s+#.*$""")
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.S)
 PLAN_FIELDS = ("status", "assignee", "blocked_at", "blocked_reason")
 COMMENT_RE = re.compile(r"<!--.*?-->", re.S)  # a template's example sits in one
@@ -99,42 +101,34 @@ class StoreRefusal(Exception):
 # ---------------------------------------------------------------- frontmatter
 
 
-def parse_frontmatter(text: str, lenient: bool = False) -> dict:
-    """Minimal YAML subset: `key: value`, lists as `[a, b]`, quoted or bare scalars. Lenient
-    skips block lists instead of refusing them, for plans written from the build's template."""
+def parse_frontmatter(text: str, where: str, lenient: bool = False) -> dict:
+    """The frontmatter as YAML reads it, an absent value as `""` and a date as its ISO text. Strict refuses
+    block lists, which the line edits here cannot rewrite; lenient takes them, for plans from the build's template."""
     m = FRONTMATTER_RE.match(text)
     if not m:
         return {}
-    data = {}
-    for line in m.group(1).splitlines():
-        if lenient and (line[:1].isspace() or line.startswith("- ")):
-            continue
-        if line.lstrip().startswith("- "):
-            raise TicketError("frontmatter lists must be inline: `key: [a, b]`")
-        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        value = value.split("   #")[0].strip()
-        quoted = QUOTED_COMMENT_RE.match(value)
-        data[key.strip()] = _scalar(quoted.group(1) if quoted else value)
-    return data
+    if not lenient and re.search(r"^[ \t]*- ", m.group(1), re.M):
+        raise TicketError(f"{where}: frontmatter lists must be inline: `key: [a, b]`")
+    try:
+        data = yaml.safe_load(m.group(1))
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)  # its line counts from the block, which starts after `---`
+        at = f" at line {mark.line + 2}" if mark else ""
+        raise TicketError(f"{where}: frontmatter is not valid YAML{at}: {getattr(e, 'problem', None) or e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise TicketError(f"{where}: frontmatter is not `key: value` lines")
+    return {key: _plain(value) for key, value in data.items()}
 
 
-def _scalar(value: str):
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        return [] if not inner else [_scalar(v.strip()) for v in inner.split(",")]
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        if value[0] == '"':
-            try:
-                return str(json.loads(value))
-            except ValueError:
-                pass
-        return value[1:-1] if value[0] == '"' else value[1:-1].replace("''", "'")
-    if value in ("true", "false"):
-        return value == "true"
-    if re.fullmatch(r"-?\d+", value):
-        return int(value)
+def _plain(value):
+    if value is None:
+        return ""
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
     return value
 
 
@@ -258,7 +252,7 @@ def load_container(folder: Path) -> dict:
     path = folder / f"{folder.name}.md"
     if not path.is_file():
         raise TicketError(f"{folder.name}: no {path.name}")
-    fm = parse_frontmatter(read_text(path))
+    fm = parse_frontmatter(read_text(path), f"{folder.name}/{path.name}")
     if fm.get("type") not in CONTAINER_TYPES:
         raise TicketError(
             f"{folder.name}/{path.name}: type {fm.get('type')!r} is not one of {', '.join(CONTAINER_TYPES)}"
@@ -324,17 +318,14 @@ def load_folder(folder: Path, problems: list[str]) -> list[dict]:
     seen = {}
     for path in sorted(tickets_dir(folder).glob("*.md")):
         text = read_text(path)
-        fm = parse_frontmatter(text, lenient=True)
+        fm = parse_frontmatter(text, f"{at}/{path.name}", lenient=True)
         if not fm and text.startswith("---") and NAME_RE.match(path.name):
             raise TicketError(f"{at}/{path.name}: frontmatter does not close")
         if fm.get("type") not in LEAF_TYPES:
             if "ticket" in fm:
                 plans.append((path.name, fm))
             continue
-        try:
-            fm = parse_frontmatter(text)
-        except TicketError as e:
-            raise TicketError(f"{at}/{path.name}: {e}") from e
+        fm = parse_frontmatter(text, f"{at}/{path.name}")
         status = _one_of(fm.get("status", ""), STATUSES, f"{at}/{path.name}", "status")
         tracker_status = _one_of(fm.get("tracker_status", ""), STATES, f"{at}/{path.name}", "tracker_status")
         n = _id(fm.get("id"))
@@ -1253,9 +1244,12 @@ def write_leaf(t: dict, tree: dict, root: Path | None) -> Path:
 
 def quoted(value: str) -> str:
     """A double-quoted scalar that `parse_frontmatter` reads back exactly."""
-    # parse_frontmatter cuts a value at "   #" and splits lines on these characters, so they go in as escapes.
-    text = json.dumps(value, ensure_ascii=False).replace("   #", "   \\u0023")
-    return text.translate({c: f"\\u{c:04x}" for c in (0x85, 0x2028, 0x2029)})
+    value.encode("utf-8")  # an undecodable argument stops here, before it could be written as an escape
+    # YAML reads some of these as line breaks and refuses others in a file, so they go in as escapes.
+    text = json.dumps(value, ensure_ascii=False)
+    return "".join(
+        c if c.isprintable() else f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}" for c in text
+    )
 
 
 def edit_frontmatter(path: Path, values: dict[str, str]) -> str:
@@ -1307,7 +1301,7 @@ def cmd_mark(args) -> dict:
         if args.assignee is not None:
             values["assignee"] = quoted(args.assignee)
         text = edit_frontmatter(path, values)
-    fm = parse_frontmatter(text, lenient=True)
+    fm = parse_frontmatter(text, path.name, lenient=True)
     return {
         "plan": str(path),
         "created": created,
@@ -1361,7 +1355,7 @@ def container_named(tree: dict, name: str, by_ref: bool) -> dict | None:
         path = folder / f"{folder.name}.md"
         if not path.is_file():
             continue
-        fm = parse_frontmatter(read_text(path), lenient=True)
+        fm = parse_frontmatter(read_text(path), f"{folder.name}/{path.name}", lenient=True)
         tracker_id = str(fm.get("tracker_id", "") or "")
         if fm.get("type") in CONTAINER_TYPES and (
             (tracker_id and tracker_id.lower() == low) or (by_ref and folder.name.lower() == low)
@@ -1599,10 +1593,10 @@ def cmd_move(args) -> dict:
         for path in sorted({*home.glob("*.md"), *([own] if own.is_file() else [])}):
             if is_old and path.parent == home and path.name == t["file"]:
                 continue
-            fm = parse_frontmatter(read_text(path), lenient=True)
+            where = f"{at}/{path.name}" if path != own else f"{folder.name}/{own.name}"
+            fm = parse_frontmatter(read_text(path), where, lenient=True)
             if fm.get("type") not in LEAF_TYPES and not (fm.get("type") in CONTAINER_TYPES and path == own):
                 continue
-            where = f"{at}/{path.name}" if path != own else f"{folder.name}/{own.name}"
             after = _list(fm.get("after"), where)
             new = [new_ref(folder, where) if names_moved(e, folder) else e for e in after]
             if new != after:
@@ -1633,7 +1627,7 @@ def cmd_move(args) -> dict:
         if (dest_home / name).exists():
             raise TicketError(f"{shown(dest)}/{name} exists already")
         if name == t["file"]:
-            fm = parse_frontmatter(read_text(old_home / name))
+            fm = parse_frontmatter(read_text(old_home / name), f"{shown(old)}/{name}")
             after = _list(fm.get("after"), f"{shown(old)}/{name}")
             new = [own_ref(e, f"{shown(old)}/{name}") for e in after]
             if new != after:
